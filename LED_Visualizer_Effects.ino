@@ -25,10 +25,11 @@ byte mac[]    = {  0xDE, 0xED, 0xBA, 0xFE, 0xFE, 0xED }; //setup a generic MAC a
 EthernetClient ethClient; //initialize an ethernet connection to the internet
 PubSubClient AIOClient(ethClient); //initialize a pubsubclient connection using the ethernet connection, called AIOClient
 
+bool updates; //make a boolean flag to let functions know if they should return and re-calculate or not
 bool powered; //make a boolean flag to hold the "on-status" of the LEDs
-int effect; //make an int to hold the current effect "number" since switch cases can only use ints and its easier than defining enums
+String ctrl_effect; //make a string to hold the current effect
 int ctrl_brightness; //make an int (0-100) to hold the brightness percentage
-String palette; //make a string to hold the palette status
+String ctrl_palette; //make a string to hold the palette status
 //string color //should be a hex thing, research 
 int ctrl_speed; //make an int (0-100) to hold the speed of effects
 
@@ -102,8 +103,11 @@ void setup()
     Ethernet.begin(mac); //start the internet connection with the MAC adress above. Add a comma and "ip" to not use DHCP
     delay(1500); //Allow the hardware to sort itself out
 
+    FastLED.clear();
+    FastLED.show();
     //AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY); //connect to the AIO feeds so we can write the default states to them so we dont have de-sync
-    powered = true;
+    powered = true; //initially powered
+    updates = false;
     ctrl_brightness = 150;
 }
 
@@ -434,20 +438,24 @@ void rainbowGradientBumpStop()
 
 void simpleChase(int ctrl_brightness) //need to document this one better, its kinda confusing and also doesnt work with big numbers.
 {
-  int lit = 3;
-  int space = 3;
-  for (int j=0; j<space+lit; j++)
+  while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
   {
-    for (int i=0; i < (NUM_LEDS-1) - lit - space- j; i=i+lit+space)
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever. 
+    int lit = 3;
+    int space = 3;
+    for (int j=0; j<space+lit; j++)
     {
-      stripLEDs(i+j, i+j+lit-1) = CHSV(triwave8(i+j), 255, ctrl_brightness);
-      stripLEDs(lit+j, j+lit+space-1) = CHSV(0, 0, 0);
+      for (int i=0; i < (NUM_LEDS-1) - lit - space- j; i=i+lit+space)
+      {
+        stripLEDs(i+j, i+j+lit-1) = CHSV(triwave8(i+j), 255, ctrl_brightness);
+        stripLEDs(lit+j, j+lit+space-1) = CHSV(0, 0, 0);
+      }
+      FastLED.show();
+      //delayMicroseconds(75);
+      delay(55);
+      FastLED.clear();
     }
-    FastLED.show();
-    //delayMicroseconds(75);
-    delay(55);
-    FastLED.clear();
-  } 
+  }
 }
 
 void bounce(int ctrl_brightness)
@@ -503,6 +511,7 @@ void lighthouse()
 
 void handleFeeds(char* topic, byte* payload, unsigned int length) //the function that is called anytime there is new data in any of the feeds
 {
+  updates = true; //set the update flag to true because something has changed
   //right now just display the message, will write the switch cases later
   Serial.print("Message arrived [");
   Serial.print(topic);
@@ -511,12 +520,56 @@ void handleFeeds(char* topic, byte* payload, unsigned int length) //the function
     Serial.print((char)payload[i]);
   }
   Serial.println();
-  //if (topic == 'FillGee/feeds/effect')
-  //{
-    //Serial.println("Data was for the effect status");
-    effect = (int)payload[0]; //should update the effect global integer with the first byte of data? who knows
-    Serial.println(effect);
-  //}
+  if (strcmp(topic, "FillGee/feeds/effect") == 0) //we use this str compare function (which returns 0 when the strings are the same) to find out which topic it is
+  {
+    Serial.print("Updated the effect status to: ");
+    payload[length] = '\0'; //add the escape character at the end of this byte we have a string in
+    ctrl_effect = String((char*)payload); //cast the payload to a char and convert to a string which we store in our global effect variable
+    Serial.println(ctrl_effect);
+  }
+  
+  if (strcmp(topic, "FillGee/feeds/on-status") == 0) //this handles messages in the on-status feed
+  {
+    Serial.print("Updated the power status to: ");
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    if (s == "ON")
+    {
+      Serial.println("ON");
+      powered = true;
+    }
+    if (s == "OFF")
+    {
+      Serial.println("OFF");
+      powered = false;
+    }
+  }
+  
+  if (strcmp(topic, "FillGee/feeds/led-brightness") == 0) //handles the brightness feed which makes things bright or not
+  {
+    Serial.print("Updated the brightness to: ");
+    payload[length] = '\0';
+    String b = String((char*)payload);
+    ctrl_brightness = b.toInt();
+    Serial.println(ctrl_brightness);
+  }
+
+  if (strcmp(topic, "FillGee/feeds/speed") == 0) //handles the speed feed which makes faster or slower effects
+  {
+    Serial.print("Updated the speed to: ");
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    ctrl_speed = s.toInt();
+    Serial.println(ctrl_speed);
+  }
+  
+  if (strcmp(topic, "FillGee/feeds/current-palette") == 0) //handles the palette switching
+  {
+    Serial.print("Updated the current palette to: ");
+    payload[length] = '\0'; //add the escape character at the end of this byte we have a string in
+    ctrl_palette = String((char*)payload); //cast the payload to a char and convert to a string which we store in our global palette variable
+    Serial.println(ctrl_palette);
+  }
 }
 
 void reconnect() //function that connects to AIO and subscribes to the feeds
@@ -544,19 +597,31 @@ void reconnect() //function that connects to AIO and subscribes to the feeds
   }
 }
 
-void doLights(int effect, String palette, int ctrl_brightness, int ctrl_speed)
+void doLights(String effect, String palette, int ctrl_brightness, int ctrl_speed)
 {
-  switch (effect) 
+  updates = false;
+  if (powered)
   {
-  case 52: //4 in decimal ascii
-    simpleChase(ctrl_brightness); //implement speed, palette later
-    break;
-  case 56: //8 in decimal ascii
-    bounce(ctrl_brightness); //implement speed, palette later
-    break;
-  default:
-    //bounceUsingWaves();
-    break;
+    if (effect == "Simple Chase")
+    {
+      Serial.println("Starting chase function");
+      simpleChase(ctrl_brightness); //implement speed, palette later
+    }
+    if (effect == "Bounce")
+    {
+      Serial.println("Starting bounce function");
+      bounce(ctrl_brightness); //implement speed, palette later
+    }
+    else
+    {
+      FastLED.clear();
+      FastLED.show();
+    }
+  }
+  else
+  {
+    FastLED.clear();
+    FastLED.show(); 
   }
 }
 
@@ -567,14 +632,8 @@ void loop()
     reconnect();
   }
   AIOClient.loop(); //check the data in the feeds
-  if (powered) //if the boolean from on-status is true
-  {
-    doLights(effect, palette, ctrl_brightness, ctrl_speed);
-  }
-  else
-  {
-    FastLED.clear();
-  }
+  doLights(ctrl_effect, ctrl_palette, ctrl_brightness, ctrl_speed);
+
   /***Pick ONLY ONE of the following effects to run *************/
   //bumpsOnlyFlashesToNeutral();
   //bumpsOnlyFlashesToBlack();
