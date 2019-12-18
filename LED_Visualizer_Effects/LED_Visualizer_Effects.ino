@@ -1,20 +1,37 @@
-#include "LedControl.h"
-#include "binary.h"
 #include "FastLED.h"
-//#include "AdafruitIO_Ethernet.h"
+#include "SPI.h"
+#include "Ethernet.h"
+#include "PubSubClient.h"
 
-//Declare Spectrum Shield pin connections
+//no longer really needed with ADC, leaving so it compiles until rewrite made
 #define STROBE 4
 #define RESET 5
-#define AUDIO_IN A5
-#define DELAY 25
+#define AUDIO_IN A2
 
-/*
-//define the pins to drive the matrix so we can change them later if needed
-#define DATA 12
-#define CS 11
-#define CLK 10
-*/
+
+// ALL THE ETHERNET PUBSUB DATA TO CONNECT US TO THE MQTT FEEDS. DOCUMENTATION HERE: https://pubsubclient.knolleary.net/api.html#publish1
+#define AIO_USERNAME  "FillGee"
+#define AIO_KEY ""
+#define SERVER "io.adafruit.com"
+#define PORT 1883
+#define FEED1 "FillGee/feeds/on-status"
+#define FEED2 "FillGee/feeds/effect"
+#define FEED3 "FillGee/feeds/led-brightness"
+#define FEED4 "FillGee/feeds/current-palette"
+#define FEED5 "FillGee/feeds/single-color"
+#define FEED6 "FillGee/feeds/speed"
+byte mac[]    = {  0xDE, 0xED, 0xBA, 0xFE, 0xFE, 0xED }; //setup a generic MAC adress for the teensy
+//IPAddress ip(192, 168, 0, 182); //in case we dont want to use DHCP we can have it connect under a certain IP address
+EthernetClient ethClient; //initialize an ethernet connection to the internet
+PubSubClient AIOClient(ethClient); //initialize a pubsubclient connection using the ethernet connection, called AIOClient
+
+bool updates; //make a boolean flag to let functions know if they should return and re-calculate or not
+bool powered; //make a boolean flag to hold the "on-status" of the LEDs
+String ctrl_effect; //make a string to hold the current effect
+int ctrl_brightness; //make an int (0-100) to hold the brightness percentage
+String ctrl_palette; //make a string to hold the palette status
+//string color //should be a hex thing, research 
+int ctrl_speed; //make an int (0-100) to hold the speed of effects
 
 //define all the FastLED strip info so its here to change if needed. Updated to use teensy 4.0 parallel output stuff
 #define STRIP_DATA 14
@@ -24,23 +41,10 @@
 #define STRIP_TYPE WS2812B
 #define COLOR_ORDER GRB
 
-/* COMMENTED OUT UNTIL TEENSY
-//Adafruit IO setup stuff
-#define IO_USERNAME "FillGee"
-#define IO_KEY "5afc1d57eb30409283b0565a088a797b"
-AdafruitIO_Ethernet io(IO_USERNAME, IO_KEY);
-AdafruitIO_Feed *power = io.feed("on-status"); //tell the arduino to look at the on-status feed anytime we say "power"
-bool enabled = false; //setup a boolean flag for the power status, and set it to be off to start.
-*/
 
 CRGBArray<NUM_LEDS_PER_STRIP * NUM_STRIPS> stripLEDs; //make an array with an entry for each LED on the strip, of the type CRGB which is used by FastLED
 
-//define the column "intensities" so we dont need to type them out every time
-//byte columnFill[] = {B00000000, B00000001, B00000011, B00000111, B00001111, B00011111, B00111111, B01111111, B11111111};
-//byte columnMax[] = {B00000000, B00000001, B00000010, B00000100, B00001000, B00010000, B00100000, B01000000, B10000000};
-
-//LedControl lc=LedControl(DATA,CLK,CS,1);
-
+/****************THIS WILL ALL BE DELETED NOW THAT THE MSGEQ7s ARE NO LONGER USED IN FAVOR OF ADC AUDIO PROCESSING ********************************/ 
 int freq;
 int Frequencies_One[7];
 int audioAmplitudes[7];
@@ -49,8 +53,9 @@ int i;
 int matrixRow;
 int matrixColumn;
 
+
 //testing out looking at max volumes and when the music should "bump"
-//shamelessly stolen from https://github.com/bartlettmic/SparkFun-RGB-LED-Music-Sound-Visualizer-Arduino-Code/blob/master/Visualizer_Program/Visualizer_Program.ino
+//based on https://github.com/bartlettmic/SparkFun-RGB-LED-Music-Sound-Visualizer-Arduino-Code/blob/master/Visualizer_Program/Visualizer_Program.ino
 
 #define BUMP_VALUE 375 //have a constant for the value that the audio needs to exceed in order for it to be a bump. Works best around 300-400
 #define BUMP_DIFFICULTY .925 //the difficulty on a scale of 1-10 that a new bump will trigger as one based on average bumps in the past. should be .9-1.0
@@ -61,19 +66,21 @@ float avgBumps[] = {BUMP_VALUE, BUMP_VALUE, BUMP_VALUE, BUMP_VALUE, BUMP_VALUE, 
 int lastAmplitudes[] = {0, 0, 0, 0, 0, 0, 0}; //holds the previous values of each frequency so we can compare to the current
 bool bumps[] = {false, false, false, false, false, false, false}; //have a boolean for if each frequency is experiencing a bump
 
+/****************THIS WILL ALL BE DELETED NOW THAT THE MSGEQ7s ARE NO LONGER USED IN FAVOR OF ADC AUDIO PROCESSING ********************************/
+
 CRGB avgColor;
 CRGB oldAvgColor;
 CRGB currentFlash;
 
 void setup() 
 {
-  // put your setup code here, to run once:
+  /* THIS WAS OLD MSGEQ7 AND MATRIX SETUP, NO LONGER NEEDED, KEEPING SO IT WILL COMPILE UNTIL RE-WRITE */
     pinMode(STROBE, OUTPUT);
     pinMode(RESET, OUTPUT);
     pinMode(AUDIO_IN, INPUT);  
     digitalWrite(STROBE, HIGH);
     digitalWrite(RESET, HIGH);
-    //Serial.begin(115200);
+    Serial.begin(115200);
     
     //Initialize Spectrum Analyzers
     digitalWrite(STROBE, LOW);
@@ -86,42 +93,26 @@ void setup()
     delay(1);
     digitalWrite(RESET, LOW);
 
-     /*
-    The MAX72XX is in power-saving mode on startup,
-    we have to do a wakeup call
-    */
-    //lc.shutdown(0,false);
-    /* Set the brightness to a medium values */
-    //lc.setIntensity(0,5);
-    /* and clear the display */
-    //lc.clearDisplay(0);
-
     FastLED.addLeds<NUM_STRIPS, WS2812B, STRIP_DATA, COLOR_ORDER>(stripLEDs, NUM_LEDS); //constructs the led strip with FastLED so it knows how to drive it
     FastLED.setBrightness(255); //set the brightness globally, everything else will be a percentage of this?
     FastLED.clear();
     FastLED.show();
 
-    /* COMMENTED OUT UNTIL TEENSY
-    //setup the Adafruit IO connection
-    Serial.println(F("Connecting to Adafruit IO"));
-    io.connect();
+    AIOClient.setServer(SERVER, PORT); //connect to the MQTT server and port defined above
+    AIOClient.setCallback(handleFeeds); //set the function that will be called anytime that the MQTT client recieves data. In this case, the funciton handleFeeds()
+    Ethernet.begin(mac); //start the internet connection with the MAC adress above. Add a comma and "ip" to not use DHCP
+    delay(1500); //Allow the hardware to sort itself out
 
-    //while waiting for the connection just type dots so we know its waiting
-    while(io.status() < AIO_CONNECTED) 
-    {
-      Serial.print(F("."));
-      delay(500);
-    }
-    //once connected we print the status?
-    Serial.println(io.statusText());
-
-    power->onMessage(handlePower); //when "power" (on-status) gets new data, it passes to the handlePower() function below
-    power->get(); //read the current value in the feed and handle it
-    */
+    FastLED.clear();
+    FastLED.show();
+    //AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY); //connect to the AIO feeds so we can write the default states to them so we dont have de-sync
+    powered = true; //initially powered
+    updates = false;
+    ctrl_brightness = 150;
 }
 
 
-/*************Pull frquencies from Spectrum Shield****************/
+/*************Pull frquencies from Spectrum Shield. No longer needed, will delete later****************/
 void readFrequencies(int freq)
 {
   //Read frequencies for each band
@@ -132,6 +123,7 @@ void readFrequencies(int freq)
     delayMicroseconds  (100);                    // Delay necessary due to timing diagram 
 }
 
+// NO LONGER NEEDED WITH NEW AUDIO PROCESSING, WILL DELETE LATER
 void detectBumps(int freq)
 {
     if (audioAmplitudes[freq] > maxAmplitudes[freq]) //if the new value is greater than our previous maximum
@@ -153,22 +145,7 @@ void detectBumps(int freq)
     lastAmplitudes[freq] = audioAmplitudes[freq];
 }
 
-/*
-void matrixGraph(int i)
-{
-    intensity = audioAmplitudes[i] / 125; //we have 8 LEDs vertically to show the intensity of each band. 1000/8 is 125, so each 125 change in intensity will light up another led vertically
-    //lc.setColumn(0, i, columnMax[intensity]);
-    if (bumps[i])
-    {
-      //lc.setColumn(0, 7, columnFill[8]);
-    }
-    else
-    {
-      //lc.setColumn(0, 7, columnFill[0]);
-    }
-}
-*/
-
+//This will be changed significantly when new audio processing is handled. Goodbye all the hacky math
 void addSingleColorPixel()
 {
    //find the frequencies with the highest amplitude and just calculate the color based on that?
@@ -211,6 +188,7 @@ void addSingleColorPixel()
   delayMicroseconds(75);
 }
 
+//This will be changed significantly when new audio processing is handled. Goodbye all the hacky math
 void calculateColor(int band, int value, float multiplier)
 {
   int topValue = 220;
@@ -278,7 +256,6 @@ void sevenBandEQFromMid()
   {
     readFrequencies(i);
     detectBumps(i);
-    //matrixGraph(i);
     int bandLength = NUM_LEDS / 7;
     intensity = map(audioAmplitudes[i], 150, 1024, 0, bandLength);
     int saturation = 220;
@@ -322,7 +299,6 @@ void sevenBandEQ()
   {
     readFrequencies(i);
     detectBumps(i);
-    //matrixGraph(i);
     int bandLength = NUM_LEDS / 7;
     intensity = map(audioAmplitudes[i], 150, 1024, 0, bandLength);
     int saturation = 200;
@@ -365,7 +341,6 @@ void bumpsOnlyLinear()
   {
     readFrequencies(i);
     detectBumps(i);
-    //matrixGraph(i);
     addBumpPixel(i);
   }
 }
@@ -375,7 +350,6 @@ void linearSpectrumNoBumps()
   for (int i=0; i<7; i++)
   {
     readFrequencies(i);
-    //matrixGraph(i);
   }
   addSingleColorPixel();
 }
@@ -386,7 +360,6 @@ void linearSpectrumWithBumps()
   {
     readFrequencies(i);
     detectBumps(i);
-    //matrixGraph(i);
     addBumpPixel(i);   
   }
   addSingleColorPixel();
@@ -399,7 +372,6 @@ void bumpsOnlyFlashesToNeutral()
   {
     readFrequencies(i);
     detectBumps(i);
-    //matrixGraph(i);
     if (bumps[i])
     {
       fill_solid(stripLEDs, NUM_LEDS, CHSV(i*36, 255, 150));
@@ -422,7 +394,6 @@ void bumpsOnlyFlashesToBlack()
   {
     readFrequencies(i);
     detectBumps(i);
-    //matrixGraph(i);
     if (bumps[i])
     {
       fill_solid(stripLEDs, NUM_LEDS, CHSV(i*36, 225, 125));
@@ -446,7 +417,6 @@ void rainbowGradientBumpStop()
     {
       readFrequencies(i);
       detectBumps(i);
-      //matrixGraph(i);
       if (bumps[i])
       {
         //fill_solid(stripLEDs, NUM_LEDS, CHSV(i*36, 255, 150));
@@ -466,58 +436,35 @@ void rainbowGradientBumpStop()
   } 
 }
 
-/* COMMENTED OUT UNTIL WE GET THE TEENSY 
-void handlePower(AdafruitIO_Data *data) //the function that is called anytime there is new data in the "on-status" feed
+void simpleChase(int ctrl_brightness) //need to document this one better, its kinda confusing and also doesnt work with big numbers.
 {
-  Serial.println(data->toString());
-  if (data->toString() == "ON")
+  while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
   {
-    enabled = true;
-  }
-  else
-  {
-    enabled = false;
-  }
-}
-*/
-void simpleChase()
-{
-  int lit = 3;
-  int space = 3;
-  for (int j=0; j<space+lit; j++)
-  {
-    for (int i=0; i < (NUM_LEDS-1) - lit - space- j; i=i+lit+space)
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever. 
+    int lit = 3;
+    int space = 3;
+    for (int j=0; j<space+lit; j++)
     {
-      stripLEDs(i+j, i+j+lit-1) = CHSV(triwave8(i+j), 150, triwave8(i+j));
-      stripLEDs(lit+j, j+lit+space-1) = CHSV(0, 0, 0);
+      for (int i=0; i < (NUM_LEDS-1) - lit - space- j; i=i+lit+space)
+      {
+        stripLEDs(i+j, i+j+lit-1) = CHSV(triwave8(i+j), 255, ctrl_brightness);
+        stripLEDs(lit+j, j+lit+space-1) = CHSV(0, 0, 0);
+      }
+      FastLED.show();
+      //delayMicroseconds(75);
+      delay(55);
+      FastLED.clear();
     }
-    FastLED.show();
-    //delayMicroseconds(75);
-    delay(35);
-    FastLED.clear();
   }
-  /*
-  for (int j=0; j<255; j++)
-  {
-  for (int i=0; i<NUM_LEDS; i++)
-  {
-    stripLEDs[i] = CHSV(sin8(i+j), 255, cos8((i+j)*128));
-    //FastLED.show();
-  }
-  delay(75); //50 works but is too quick. 75 should prob be the minimum
-  //
-  }
-  */
-  
 }
 
-void bounce()
+void bounce(int ctrl_brightness)
 {
   uint8_t spd = 1;
   for (uint16_t i=0; i<NUM_LEDS-spd; i+=spd)
   {
     fadeToBlackBy(stripLEDs, NUM_LEDS, (64 /  spd));
-    stripLEDs[i] = CHSV((triwave8(i)), random8(150,255), 150);
+    stripLEDs[i] = CHSV((triwave8(i)), random8(150,255), ctrl_brightness);
     FastLED.show();
     //FastLED.clear();
     delayMicroseconds(75);
@@ -525,20 +472,20 @@ void bounce()
   for (uint16_t j=NUM_LEDS-1; j>=0+spd; j-=spd)
   {
     fadeToBlackBy(stripLEDs, NUM_LEDS, (64 / spd));
-    stripLEDs[j] = CHSV((triwave8(j)), random8(150,255), 150);
+    stripLEDs[j] = CHSV((triwave8(j)), random8(150,255), ctrl_brightness);
     FastLED.show();
     //FastLED.clear();
     delayMicroseconds(75);
   }
 }
 
-void bounceUsingWaves() //neat lightweight implementation using the triwave function and mapping it to our length. 
+void bounceUsingWaves() //neat lightweight implementation using the triwave function and mapping it to our length. Issue is it wont hit every LED because waves only go 0-255
 {
   for (uint8_t i=0; i<256; i++)
   {
     stripLEDs[map(triwave8(i), 0, 255, 0, NUM_LEDS-1)] = CHSV(sin8(i), 255, 150);
     FastLED.show();
-    delayMicroseconds(100);
+    delayMicroseconds(150);
     FastLED.clear();
   }
 }
@@ -562,10 +509,131 @@ void lighthouse()
   
 }
 
+void handleFeeds(char* topic, byte* payload, unsigned int length) //the function that is called anytime there is new data in any of the feeds
+{
+  updates = true; //set the update flag to true because something has changed
+  //right now just display the message, will write the switch cases later
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i=0;i<length;i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+  if (strcmp(topic, "FillGee/feeds/effect") == 0) //we use this str compare function (which returns 0 when the strings are the same) to find out which topic it is
+  {
+    Serial.print("Updated the effect status to: ");
+    payload[length] = '\0'; //add the escape character at the end of this byte we have a string in
+    ctrl_effect = String((char*)payload); //cast the payload to a char and convert to a string which we store in our global effect variable
+    Serial.println(ctrl_effect);
+  }
+  
+  if (strcmp(topic, "FillGee/feeds/on-status") == 0) //this handles messages in the on-status feed
+  {
+    Serial.print("Updated the power status to: ");
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    if (s == "ON")
+    {
+      Serial.println("ON");
+      powered = true;
+    }
+    if (s == "OFF")
+    {
+      Serial.println("OFF");
+      powered = false;
+    }
+  }
+  
+  if (strcmp(topic, "FillGee/feeds/led-brightness") == 0) //handles the brightness feed which makes things bright or not
+  {
+    Serial.print("Updated the brightness to: ");
+    payload[length] = '\0';
+    String b = String((char*)payload);
+    ctrl_brightness = b.toInt();
+    Serial.println(ctrl_brightness);
+  }
+
+  if (strcmp(topic, "FillGee/feeds/speed") == 0) //handles the speed feed which makes faster or slower effects
+  {
+    Serial.print("Updated the speed to: ");
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    ctrl_speed = s.toInt();
+    Serial.println(ctrl_speed);
+  }
+  
+  if (strcmp(topic, "FillGee/feeds/current-palette") == 0) //handles the palette switching
+  {
+    Serial.print("Updated the current palette to: ");
+    payload[length] = '\0'; //add the escape character at the end of this byte we have a string in
+    ctrl_palette = String((char*)payload); //cast the payload to a char and convert to a string which we store in our global palette variable
+    Serial.println(ctrl_palette);
+  }
+}
+
+void reconnect() //function that connects to AIO and subscribes to the feeds
+{
+  while (!AIOClient.connected())  // Loop until we're reconnected
+  {
+    Serial.print("Attempting MQTT connection...");
+    if (AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY)) //try to connect to the AIO server with the username and password defined at the top
+    {
+      Serial.println("connected");
+      AIOClient.subscribe(FEED1);
+      AIOClient.subscribe(FEED2);
+      AIOClient.subscribe(FEED3);
+      AIOClient.subscribe(FEED4);
+      AIOClient.subscribe(FEED5);
+      AIOClient.subscribe(FEED6);
+    }
+    else
+    {
+      Serial.print("failed, rc=");
+      Serial.print(AIOClient.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000); // Wait 5 seconds before retrying
+    }
+  }
+}
+
+void doLights(String effect, String palette, int ctrl_brightness, int ctrl_speed)
+{
+  updates = false;
+  if (powered)
+  {
+    if (effect == "Simple Chase")
+    {
+      Serial.println("Starting chase function");
+      simpleChase(ctrl_brightness); //implement speed, palette later
+    }
+    if (effect == "Bounce")
+    {
+      Serial.println("Starting bounce function");
+      bounce(ctrl_brightness); //implement speed, palette later
+    }
+    else
+    {
+      FastLED.clear();
+      FastLED.show();
+    }
+  }
+  else
+  {
+    FastLED.clear();
+    FastLED.show(); 
+  }
+}
 
 void loop() 
 {
-  //io.run();
+  if (!AIOClient.connected()) //if we arent connected to the AIO feeds, reconnect
+  {
+    reconnect();
+  }
+  AIOClient.loop(); //check the data in the feeds
+  doLights(ctrl_effect, ctrl_palette, ctrl_brightness, ctrl_speed);
+
   /***Pick ONLY ONE of the following effects to run *************/
   //bumpsOnlyFlashesToNeutral();
   //bumpsOnlyFlashesToBlack();
@@ -575,7 +643,7 @@ void loop()
   //bumpsOnlyLinear();
   //sevenBandEQFromMid();
   //sevenBandEQ();
-  simpleChase();
+  //simpleChase();
   //bounceUsingWaves();
   //bounce();
   //testSin();
