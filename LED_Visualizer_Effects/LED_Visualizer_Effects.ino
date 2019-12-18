@@ -72,6 +72,10 @@ CRGB avgColor;
 CRGB oldAvgColor;
 CRGB currentFlash;
 
+int oldHueDiff[300];
+int currentHueDiff[300];
+int baseHue;
+
 void setup() 
 {
   /* THIS WAS OLD MSGEQ7 AND MATRIX SETUP, NO LONGER NEEDED, KEEPING SO IT WILL COMPILE UNTIL RE-WRITE */
@@ -105,10 +109,16 @@ void setup()
 
     FastLED.clear();
     FastLED.show();
-    //AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY); //connect to the AIO feeds so we can write the default states to them so we dont have de-sync
+    AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY); //connect to the AIO feeds so we can write the default states to them so we dont have de-sync
     powered = true; //initially powered
+    AIOClient.publish("FillGee/feeds/on-status", "ON"); //send the initial power state to MQTT so we dont have a de-sync on the dashboard
+    ctrl_brightness = 125;
+    AIOClient.publish("FillGee/feeds/led-brightness", "125"); //set initial brightness to 125 and send that over MQTT
+    AIOClient.publish("FillGee/feeds/effect", "None"); //set initial brightness to 125 and send that over MQTT
     updates = false;
-    ctrl_brightness = 150;
+    Serial.println("Connected to Adafruit IO and set initial values!");
+    AIOClient.disconnect(); //dont know why this is needed, but if we dont have it the MQTT updates never come through. I guess between publishing and subscribing it needs to disconnect?
+    Serial.println("Disconnecting from Adafruit IO now that initial values have been set.");
 }
 
 
@@ -494,12 +504,21 @@ void bounceUsingWaves() //neat lightweight implementation using the triwave func
 //triwave is perfectly linear, period of 128 with values of 0-255. One increase in i = 2 increase in output. triwave(0) = 0
 void testSin()
 {
+  int scale = 50;
+  int x = random16();
+  int y = random16();
+  int z = random16();
   for (int i=0; i<NUM_LEDS; i++)
   {
     Serial.print("Current i value: ");
     Serial.print(i);
     Serial.print(". Triwave of i value: ");
-    Serial.println(triwave8(i));
+    Serial.print(triwave8(i));
+    Serial.print(". inoise8 of i value: ");
+    Serial.println(inoise8((x + i*scale), (y + i*scale), z));
+    x += scale / 4;
+    y -= scale / 8;
+    z += scale;
   }
   delay(9999999999999999999999999999999999999999999999999);
 }
@@ -507,6 +526,33 @@ void testSin()
 void lighthouse()
 {
   
+}
+
+void noise(int bright)
+{
+  int scale = 100; //makes the noise more... noisy
+  int difference = 85; //the maximum difference in hues that the "noise" can have from the base hue
+  int x = random16(); //get random numbers for x, y, z to seed the noise
+  int y = random16();
+  int z = random16();
+  while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
+  {
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.  
+    for (int i=0; i<NUM_LEDS; i++)
+    {
+      oldHueDiff[i] = currentHueDiff[i];
+      currentHueDiff[i] = map(inoise8((x + i*scale), (y + baseHue*scale), z), 0, 255, (-1 * (difference / 2)), (difference / 2)); //map the noise taken with 3 variables to a range of the difference, from -.5difference to +.5difference
+    
+      CHSV blendedColor = blend(CHSV(baseHue+oldHueDiff[i], 255, bright), CHSV(baseHue+currentHueDiff[i], 255, bright), 100); //blend between color + old noise and new noise to have a smoother looking transition that can still update quickly
+      stripLEDs[i] = blendedColor;
+      x += scale / 4; //update the x, y, and z values at different rates as we go down the strip so each light can be different
+      y -= scale / 8;
+      z += scale;
+    }
+  FastLED.show();
+  delay(60);
+  baseHue = ((baseHue + 1) % 255); //change the baseHue slowly each loop and make sure it doesnt go over 255.
+  }
 }
 
 void handleFeeds(char* topic, byte* payload, unsigned int length) //the function that is called anytime there is new data in any of the feeds
@@ -576,10 +622,10 @@ void reconnect() //function that connects to AIO and subscribes to the feeds
 {
   while (!AIOClient.connected())  // Loop until we're reconnected
   {
-    Serial.print("Attempting MQTT connection...");
+    Serial.print("Reconnecting to Adafruit IO... ");
     if (AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY)) //try to connect to the AIO server with the username and password defined at the top
     {
-      Serial.println("connected");
+      Serial.println("Connected successfully");
       AIOClient.subscribe(FEED1);
       AIOClient.subscribe(FEED2);
       AIOClient.subscribe(FEED3);
@@ -597,7 +643,7 @@ void reconnect() //function that connects to AIO and subscribes to the feeds
   }
 }
 
-void doLights(String effect, String palette, int ctrl_brightness, int ctrl_speed)
+void doLights(String effect, String palette, int bright, int spd)
 {
   updates = false;
   if (powered)
@@ -605,23 +651,30 @@ void doLights(String effect, String palette, int ctrl_brightness, int ctrl_speed
     if (effect == "Simple Chase")
     {
       Serial.println("Starting chase function");
-      simpleChase(ctrl_brightness); //implement speed, palette later
+      simpleChase(bright); //implement speed, palette later
     }
     if (effect == "Bounce")
     {
       Serial.println("Starting bounce function");
-      bounce(ctrl_brightness); //implement speed, palette later
+      bounce(bright); //implement speed, palette later
+    }
+    if (effect == "Noise")
+    {
+      Serial.println("Starting noise function");
+      noise(bright);
     }
     else
     {
       FastLED.clear();
       FastLED.show();
+      delay(25);
     }
   }
   else
   {
     FastLED.clear();
-    FastLED.show(); 
+    FastLED.show();
+    delay(25);
   }
 }
 
@@ -635,6 +688,7 @@ void loop()
   doLights(ctrl_effect, ctrl_palette, ctrl_brightness, ctrl_speed);
 
   /***Pick ONLY ONE of the following effects to run *************/
+  //noise();
   //bumpsOnlyFlashesToNeutral();
   //bumpsOnlyFlashesToBlack();
   //rainbowGradientBumpStop();
