@@ -74,7 +74,9 @@ CRGB currentFlash;
 
 int oldHueDiff[300];
 int currentHueDiff[300];
-int baseHue;
+uint8_t baseHue;
+
+CRGBPalette16 currentPalette;
 
 void setup() 
 {
@@ -112,13 +114,19 @@ void setup()
     AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY); //connect to the AIO feeds so we can write the default states to them so we dont have de-sync
     powered = true; //initially powered
     AIOClient.publish("FillGee/feeds/on-status", "ON"); //send the initial power state to MQTT so we dont have a de-sync on the dashboard
-    ctrl_brightness = 125;
-    AIOClient.publish("FillGee/feeds/led-brightness", "125"); //set initial brightness to 125 and send that over MQTT
-    AIOClient.publish("FillGee/feeds/effect", "None"); //set initial brightness to 125 and send that over MQTT
+    ctrl_brightness = 90;
+    AIOClient.publish("FillGee/feeds/led-brightness", "90"); //set initial brightness to 90 and send that over MQTT
+    ctrl_effect = "Noise";
+    AIOClient.publish("FillGee/feeds/effect", "Noise"); //set initial effect to noise since its the most interesting and sync with MQTT
+    currentPalette = RainbowColors_p;
+    AIOClient.publish("FillGee/feeds/current-palette", "RainbowColors_p"); //set initial palette to rainbow colors as its the most visually interesting and sync with MQTT
+    
     updates = false;
     Serial.println("Connected to Adafruit IO and set initial values!");
     AIOClient.disconnect(); //dont know why this is needed, but if we dont have it the MQTT updates never come through. I guess between publishing and subscribing it needs to disconnect?
     Serial.println("Disconnecting from Adafruit IO now that initial values have been set.");
+
+    
 }
 
 
@@ -446,7 +454,7 @@ void rainbowGradientBumpStop()
   } 
 }
 
-void simpleChase(int ctrl_brightness) //need to document this one better, its kinda confusing and also doesnt work with big numbers.
+void simpleChase(int bright) //need to document this one better, its kinda confusing and also doesnt work with big numbers.
 {
   while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
   {
@@ -457,7 +465,7 @@ void simpleChase(int ctrl_brightness) //need to document this one better, its ki
     {
       for (int i=0; i < (NUM_LEDS-1) - lit - space- j; i=i+lit+space)
       {
-        stripLEDs(i+j, i+j+lit-1) = CHSV(triwave8(i+j), 255, ctrl_brightness);
+        stripLEDs(i+j, i+j+lit-1) = ColorFromPalette(currentPalette, baseHue, bright, LINEARBLEND); //
         stripLEDs(lit+j, j+lit+space-1) = CHSV(0, 0, 0);
       }
       FastLED.show();
@@ -465,6 +473,7 @@ void simpleChase(int ctrl_brightness) //need to document this one better, its ki
       delay(55);
       FastLED.clear();
     }
+    baseHue++; //move through the hues in the palette
   }
 }
 
@@ -542,16 +551,16 @@ void noise(int bright)
     {
       oldHueDiff[i] = currentHueDiff[i];
       currentHueDiff[i] = map(inoise8((x + i*scale), (y + baseHue*scale), z), 0, 255, (-1 * (difference / 2)), (difference / 2)); //map the noise taken with 3 variables to a range of the difference, from -.5difference to +.5difference
-    
-      CHSV blendedColor = blend(CHSV(baseHue+oldHueDiff[i], 255, bright), CHSV(baseHue+currentHueDiff[i], 255, bright), 100); //blend between color + old noise and new noise to have a smoother looking transition that can still update quickly
-      stripLEDs[i] = blendedColor;
+
+      //next line is a very long one that just blends between the last noise and the current one for a color in the palette to smooth out the pixel flickering
+      stripLEDs[i] = blend(ColorFromPalette(currentPalette, baseHue+currentHueDiff[i], bright, LINEARBLEND), ColorFromPalette(currentPalette, baseHue+oldHueDiff[i], bright, LINEARBLEND), 100);
       x += scale / 4; //update the x, y, and z values at different rates as we go down the strip so each light can be different
       y -= scale / 8;
       z += scale;
     }
   FastLED.show();
   delay(60);
-  baseHue = ((baseHue + 1) % 255); //change the baseHue slowly each loop and make sure it doesnt go over 255.
+  baseHue++; //move through the palette hues
   }
 }
 
@@ -615,6 +624,40 @@ void handleFeeds(char* topic, byte* payload, unsigned int length) //the function
     payload[length] = '\0'; //add the escape character at the end of this byte we have a string in
     ctrl_palette = String((char*)payload); //cast the payload to a char and convert to a string which we store in our global palette variable
     Serial.println(ctrl_palette);
+    //not sure if there is a better way of doing this since switch cases dont take strings, enums are annoying, etc. While it could be more elegant it might not be worth the effort
+    if (ctrl_palette == "RainbowColors_p")
+    {
+      currentPalette = RainbowColors_p;
+    }
+    if (ctrl_palette == "RainbowStripeColors_p")
+    {
+      currentPalette = RainbowStripeColors_p;
+    }
+    if (ctrl_palette == "PartyColors_p")
+    {
+      currentPalette = PartyColors_p;
+    }
+    if (ctrl_palette == "OceanColors_p")
+    {
+      currentPalette = OceanColors_p;
+    }
+    if (ctrl_palette == "CloudColors_p")
+    {
+      currentPalette = CloudColors_p;
+    }
+    if (ctrl_palette == "ForestColors_p")
+    {
+      currentPalette = ForestColors_p;
+    }
+    if (ctrl_palette == "LavaColors_p")
+    {
+      currentPalette = LavaColors_p;
+    }
+    if (ctrl_palette == "HeatColors_p")
+    {
+      currentPalette = HeatColors_p;
+    }
+    
   }
 }
 
@@ -651,17 +694,17 @@ void doLights(String effect, String palette, int bright, int spd)
     if (effect == "Simple Chase")
     {
       Serial.println("Starting chase function");
-      simpleChase(bright); //implement speed, palette later
-    }
+      simpleChase(bright); //implement speed later
+    }  
     if (effect == "Bounce")
     {
       Serial.println("Starting bounce function");
-      bounce(bright); //implement speed, palette later
+      bounce(bright); //implement speed later
     }
     if (effect == "Noise")
     {
       Serial.println("Starting noise function");
-      noise(bright);
+      noise(bright); //implement speed later
     }
     else
     {
