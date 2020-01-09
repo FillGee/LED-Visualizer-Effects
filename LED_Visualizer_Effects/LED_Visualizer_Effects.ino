@@ -1,12 +1,27 @@
-#include "FastLED.h"
-#include "SPI.h"
-#include "Ethernet.h"
-#include "PubSubClient.h"
+#include <FastLED.h>
+#include <SPI.h>
+#include <Ethernet.h>
+#include <PubSubClient.h>
 
-//no longer really needed with ADC, leaving so it compiles until rewrite made
-#define STROBE 4
-#define RESET 5
-#define AUDIO_IN A2
+
+#include <Audio.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <SerialFlash.h> 
+
+
+AudioInputI2S            i2s1;           
+AudioAnalyzePeak         peak1;          
+AudioAnalyzeFFT1024      myFFT;      
+AudioOutputI2S           i2s2;
+
+AudioConnection          patchCord1(i2s1, 1, peak1, 0);
+AudioConnection          patchCord2(i2s1, 0, myFFT, 0);
+AudioConnection          patchCord3(i2s1, 0, i2s2, 0);
+AudioConnection          patchCord4(i2s1, 1, i2s2, 1);
+
+AudioControlSGTL5000 audioShield; 
 
 
 // ALL THE ETHERNET PUBSUB DATA TO CONNECT US TO THE MQTT FEEDS. DOCUMENTATION HERE: https://pubsubclient.knolleary.net/api.html#publish1
@@ -34,12 +49,13 @@ String ctrl_palette; //make a string to hold the palette status
 int ctrl_speed; //make an int (0-100) to hold the speed of effects
 
 //define all the FastLED strip info so its here to change if needed. Updated to use teensy 4.0 parallel output stuff
-#define STRIP_DATA 14
+#define STRIP_DATA 11
+#define CLOCK_PIN 14
 #define NUM_STRIPS 1
 #define NUM_LEDS_PER_STRIP 300
 #define NUM_LEDS 300
-#define STRIP_TYPE WS2812B
-#define COLOR_ORDER GRB
+#define STRIP_TYPE APA102
+#define COLOR_ORDER BGR
 
 
 CRGBArray<NUM_LEDS_PER_STRIP * NUM_STRIPS> stripLEDs; //make an array with an entry for each LED on the strip, of the type CRGB which is used by FastLED
@@ -53,6 +69,10 @@ int i;
 int matrixRow;
 int matrixColumn;
 
+float level[16]; //array to hold the 16 frequency bands
+int peakLevel; //int to hold the current peak/loudness level
+float averageFreq; //float to hold the "average" frequency
+float totalLevel;
 
 //testing out looking at max volumes and when the music should "bump"
 //based on https://github.com/bartlettmic/SparkFun-RGB-LED-Music-Sound-Visualizer-Arduino-Code/blob/master/Visualizer_Program/Visualizer_Program.ino
@@ -78,39 +98,29 @@ uint8_t baseHue;
 
 CRGBPalette16 currentPalette;
 
-void setup() 
+void setup()
 {
-  /* THIS WAS OLD MSGEQ7 AND MATRIX SETUP, NO LONGER NEEDED, KEEPING SO IT WILL COMPILE UNTIL RE-WRITE */
-    pinMode(STROBE, OUTPUT);
-    pinMode(RESET, OUTPUT);
-    pinMode(AUDIO_IN, INPUT);  
-    digitalWrite(STROBE, HIGH);
-    digitalWrite(RESET, HIGH);
-    Serial.begin(115200);
-    
-    //Initialize Spectrum Analyzers
-    digitalWrite(STROBE, LOW);
-    delay(1);
-    digitalWrite(RESET, HIGH);
-    delay(1);
-    digitalWrite(STROBE, HIGH);
-    delay(1);
-    digitalWrite(STROBE, LOW);
-    delay(1);
-    digitalWrite(RESET, LOW);
-
-    FastLED.addLeds<NUM_STRIPS, WS2812B, STRIP_DATA, COLOR_ORDER>(stripLEDs, NUM_LEDS); //constructs the led strip with FastLED so it knows how to drive it
+    AudioMemory(12);
+    audioShield.enable();
+    audioShield.inputSelect(AUDIO_INPUT_LINEIN);
+    audioShield.volume(0.8);
+    //myFFT.windowFunction(AudioWindowHanning1024);
+  
+    FastLED.addLeds<STRIP_TYPE, STRIP_DATA, CLOCK_PIN, COLOR_ORDER, DATA_RATE_MHZ(24)>(stripLEDs, NUM_LEDS); //constructs the led strip with FastLED so it knows how to drive it
     FastLED.setBrightness(255); //set the brightness globally, everything else will be a percentage of this?
+    
     FastLED.clear();
     FastLED.show();
+
 
     AIOClient.setServer(SERVER, PORT); //connect to the MQTT server and port defined above
     AIOClient.setCallback(handleFeeds); //set the function that will be called anytime that the MQTT client recieves data. In this case, the funciton handleFeeds()
     Ethernet.begin(mac); //start the internet connection with the MAC adress above. Add a comma and "ip" to not use DHCP
     delay(1500); //Allow the hardware to sort itself out
-
+    
     FastLED.clear();
     FastLED.show();
+
     AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY); //connect to the AIO feeds so we can write the default states to them so we dont have de-sync
     powered = true; //initially powered
     AIOClient.publish("FillGee/feeds/on-status", "ON"); //send the initial power state to MQTT so we dont have a de-sync on the dashboard
@@ -121,24 +131,64 @@ void setup()
     currentPalette = RainbowColors_p;
     AIOClient.publish("FillGee/feeds/current-palette", "RainbowColors_p"); //set initial palette to rainbow colors as its the most visually interesting and sync with MQTT
     
+    currentPalette = RainbowColors_p;
+    ctrl_brightness = 90;
     updates = false;
     Serial.println("Connected to Adafruit IO and set initial values!");
     AIOClient.disconnect(); //dont know why this is needed, but if we dont have it the MQTT updates never come through. I guess between publishing and subscribing it needs to disconnect?
     Serial.println("Disconnecting from Adafruit IO now that initial values have been set.");
-
-    
 }
 
 
-/*************Pull frquencies from Spectrum Shield. No longer needed, will delete later****************/
-void readFrequencies(int freq)
+//read the 512 FFT frequencies into 16 levels. Higher octaves need combining of many bins otherwise low bins always "win"
+void readAudioData()
 {
-  //Read frequencies for each band
-    audioAmplitudes[freq] = analogRead(AUDIO_IN);
-    digitalWrite(STROBE, HIGH);
-    delayMicroseconds(75);                    // Delay necessary due to timing diagram 
-    digitalWrite(STROBE, LOW);
-    delayMicroseconds  (100);                    // Delay necessary due to timing diagram 
+    if (myFFT.available()) 
+    {
+      level[0] =  myFFT.read(0) * 100; //multiplying by 100 gets the numbers in an easier to understand values. Total bins will add up to 100?, individual levels will be 0-100
+      level[1] =  myFFT.read(1) * 100;
+      level[2] =  myFFT.read(2, 3) * 100;
+      level[3] =  myFFT.read(4, 6) * 100;
+      level[4] =  myFFT.read(7, 10) * 100;
+      level[5] =  myFFT.read(11, 15) * 100;
+      level[6] =  myFFT.read(16, 22) * 100;
+      level[7] =  myFFT.read(23, 32) * 100;
+      level[8] =  myFFT.read(33, 46) * 100;
+      level[9] =  myFFT.read(47, 66) * 100;
+      level[10] = myFFT.read(67, 93) * 100;
+      level[11] = myFFT.read(94, 131) * 100;
+      level[12] = myFFT.read(132, 184) * 100;
+      level[13] = myFFT.read(185, 257) * 100;
+      level[14] = myFFT.read(258, 359) * 100;
+      level[15] = myFFT.read(360, 511) * 100;
+      // See this conversation to change this to more or less than 16 log-scaled bands?
+      // https://forum.pjrc.com/threads/32677-Is-there-a-logarithmic-function-for-FFT-bin-selection-for-any-given-of-bands
+
+      //calculate the "average" frequency based on the 16 above, but with a range of 1-16
+      averageFreq = 0.0;
+      totalLevel = 0.1;
+      for (int i=0; i<16; i++)
+      {
+        if (level[i] > 9.00) //ignore it if its small, which just makes the data more variable
+        {
+          averageFreq += ((i+1) * level[i]); //really just summing up all the frequencies
+          totalLevel += level[i];
+        }
+      }
+      averageFreq = averageFreq / totalLevel;
+    
+      //Serial.println(totalLevel);
+      //Serial.print("Frequency: ");
+      //Serial.println(averageFreq);
+      //Serial.println();
+      Serial.println(level[1]); //debug to see the values
+      if (peak1.available())
+      {
+        peakLevel = peak1.read() * 255.0; //this makes it into an int from 0-255 which correlates nicely to saturation/brightness
+        //Serial.print("Peak: ");
+        //Serial.println(peakLevel);
+      }
+    }
 }
 
 // NO LONGER NEEDED WITH NEW AUDIO PROCESSING, WILL DELETE LATER
@@ -163,89 +213,22 @@ void detectBumps(int freq)
     lastAmplitudes[freq] = audioAmplitudes[freq];
 }
 
-//This will be changed significantly when new audio processing is handled. Goodbye all the hacky math
+
 void addSingleColorPixel()
 {
-   //find the frequencies with the highest amplitude and just calculate the color based on that?
-  int maximum = 0;
-  int secondMax = 0;
-  int thirdMax = 0;
-  int maxIndex = 0;
-  int secondMaxIndex = 0;
-  int thirdMaxIndex = 0;
-  
-  for (int i=0; i<7; i++)
-  {
-    if (audioAmplitudes[i] > maximum)
-    {
-      thirdMax = secondMax;
-      thirdMaxIndex = secondMaxIndex;
-      //put the old max value in secondMax so we can get the second highest value
-      secondMax = maximum;
-      secondMaxIndex = maxIndex;
-      //store this new max value
-      maximum = audioAmplitudes[i];
-      maxIndex = i;
-    }
-  }
-
-
+  readAudioData(); //update the FFT and peak values to get the averageFreq
   oldAvgColor = avgColor; //take the most recent average color and store it here so we can use it to blend
-  avgColor = CRGB(0,0,0); //reset the average color to nothing so we can add stuff from scratch
-  
-  calculateColor(maxIndex, maximum, 0.7); //the maximum freqeuncy gets to set the color with .70 effectiveness
-  calculateColor(secondMaxIndex, secondMax, 0.35); //the second to the max gets to add their color,but only .35 effectiveness
-  calculateColor(thirdMaxIndex, thirdMax, 0.25); //lastly the third to max adds theirs with .25 effectiveness
+  avgColor = CHSV(averageFreq * 16, 225, peakLevel); //make the color based on average frequency and the loudness as the brightness
 
   avgColor = blend(oldAvgColor, avgColor, 128); //we can take the color between the last color and the current one to get more of a smooth gradient between colors instead of jumps from red > green etc
-  moveRight(1);
-  stripLEDs[0] = CRGB(avgColor.red, avgColor.green, avgColor.blue); //sets the first pixel to the "average" color of the song at that moment. Then use move right to move it down the chain
-  //fill_solid(stripLEDs,NUM_LEDS, CRGB(avgColor.red, avgColor.green, avgColor.blue)); //sets the whole strip to the "average" color, which will then flash to the next when its calculated.
-  //fill_gradient_RGB(stripLEDs, 0, avgColor, NUM_LEDS-1, oldAvgColor); //should make a gradient from the new color on the start to the old color on the end? Doesnt seem to work
+  moveRight(1); //move all the pixels right one before adding the new pixel
+  
+  stripLEDs[0] = avgColor; //sets the first pixel to the "average" color of the song at that moment. Then use move right to move it down the chain
+
   FastLED.show();
   delayMicroseconds(75);
 }
 
-//This will be changed significantly when new audio processing is handled. Goodbye all the hacky math
-void calculateColor(int band, int value, float multiplier)
-{
-  int topValue = 220;
-  int twoThirds = 150;
-  int oneThirds = 90;
-  float blueShift = 0.70; //literally just turn the blue values to this percent so its not so overpowering
-  float greenShift = 1.8; //increase the heck out of greens because theres not enough of them usually
-  float redShift = 0.70; //red multiplier, could maybe turn it down a tad but I like it
-  
-  switch(band)
-  {
-    case 0:
-      avgColor.red = qadd8(avgColor.red , (map(value, 0, 1024, 0, (topValue * redShift)) * multiplier));
-      break;
-    case 1:
-      avgColor.red = qadd8(avgColor.red , (map(value, 0, 1024, 0, (twoThirds * redShift)) * multiplier));
-      avgColor.blue = qadd8(avgColor.blue , (map(value, 0, 1024, 0, (oneThirds * blueShift)) * multiplier));
-      break;
-    case 2:
-      avgColor.red = qadd8(avgColor.red , (map(value, 0, 1024, 0, (oneThirds * redShift)) * multiplier));
-      avgColor.blue = qadd8(avgColor.blue , (map(value, 0, 1024, 0, (twoThirds * blueShift)) * multiplier));
-      break;
-    case 3:
-      avgColor.blue = qadd8(avgColor.blue , (map(value, 0, 1024, 0, (topValue * blueShift)) * multiplier));
-      avgColor.green = qadd8(avgColor.green , (map(value, 0, 1024, 0, (oneThirds * greenShift)) * multiplier)); //even though this should only be blue, add some green otherwise the green end is very under-utilized
-      break;
-    case 4:
-      avgColor.blue = qadd8(avgColor.blue, (map(value, 0, 1024, 0, (twoThirds * blueShift)) * multiplier));
-      avgColor.green = qadd8(avgColor.green , (map(value, 0, 1024, 0, (oneThirds * greenShift)) * multiplier));
-      break;
-    case 5:
-      avgColor.blue = qadd8(avgColor.blue , (map(value, 0, 1024, 0, (oneThirds * blueShift)) * multiplier));
-      avgColor.green = qadd8(avgColor.green , (map(value, 0, 1024, 0, (twoThirds * greenShift)) * multiplier));
-      break;
-    case 6:
-      avgColor.green = qadd8(avgColor.green , (map(value, 0, 1024, 0, (topValue * greenShift)) * multiplier));
-      break;
-  }
-}
 
 void moveRight(int pixels)
 {
@@ -267,36 +250,34 @@ void moveLeft(int pixels)
   delayMicroseconds(75);
 }
 
-void sevenBandEQFromMid()
+void EQFromMid()
 {
+  int channels = 16; //change this to another number for more/less bins. But since our FFT is set up to have 16 bins, thats what we use
   stripLEDs.fadeToBlackBy(25);
-  for (int i = 0; i < 7; i++)
+  readAudioData(); //update the 16 FFT bins
+  for (int i = 0; i < channels; i++)
   {
-    readFrequencies(i);
-    detectBumps(i);
-    int bandLength = NUM_LEDS / 7;
-    intensity = map(audioAmplitudes[i], 150, 1024, 0, bandLength);
-    int saturation = 220;
+    int bandLength = NUM_LEDS / channels; //set each band to be 1/16 of the overal strip length
+    intensity = map(level[i], 0, 50, 0, bandLength); //the amount of leds to be lit up, 50 is basically the max value any bin can have, might want to lower to make better looking
+    
     for (int j = ((i * bandLength) + (bandLength / 2)); j < ((i+1) * bandLength); j++) //start in the middle of each band length and go to the start of the next
     {
-      if (j < ((i * bandLength) + (bandLength / 2) + (intensity / 2)) || bumps[i])
+      if (j < ((i * bandLength) + (bandLength / 2) + (intensity / 2))) //for each LED in our 1/16 strip, check if we have lit less than the goal number/2 since its only the top half here
       {
-        stripLEDs[j] = CHSV(i*30, saturation, 180);
-        saturation++;
+        stripLEDs[j] = CHSV(i*(256 / channels), 220, 180); //set the color to be fraction of the CHSV color wheel, in the 16 channel case each band will have a 16 value offset in color
       }
       else
       {
-        stripLEDs[j].nscale8(196); //fade by 75%
+        stripLEDs[j].nscale8(196); //fade by 75% instead of just setting off, so if it was lit the last update it just fades
         //stripLEDs[j] = CHSV(0, 0, 0); 
       }
     }
-    saturation = 220;
+    //now do the same in reverse
     for (int j = ((i * bandLength) + (bandLength / 2)); j > (i * bandLength); j--) //start in the middle of each band length and go backwards to the start of the band
     {
-      if (j > ((i * bandLength) + (bandLength / 2) - (intensity / 2)) || bumps[i])
+      if (j > ((i * bandLength) + (bandLength / 2) - (intensity / 2)))
       {
-        stripLEDs[j] = CHSV(i*30, saturation, 180);
-        saturation++;
+        stripLEDs[j] = CHSV(i*(256 / channels), 220, 180);
       }
       else
       {
@@ -304,38 +285,36 @@ void sevenBandEQFromMid()
         //stripLEDs[j] = CHSV(0, 0, 0); 
       }
     }
-    bumps[i] = false;
   }
   FastLED.show();
   delayMicroseconds(75);
 }
 
-void sevenBandEQ()
+void EQ()
 {
+  int channels = 16; //change this to another number for more/less bins. But since our FFT is set up to have 16 bins, thats what we use
   stripLEDs.fadeToBlackBy(25);
-  for (int i = 0; i < 7; i++)
+  readAudioData(); //update the 16 FFT bins
+  for (int i = 0; i < channels; i++)
   {
-    readFrequencies(i);
-    detectBumps(i);
-    int bandLength = NUM_LEDS / 7;
-    intensity = map(audioAmplitudes[i], 150, 1024, 0, bandLength);
+    int bandLength = NUM_LEDS / channels; //set each band to be 1/16 of the overal strip length
+    intensity = map(level[i], 0, 50, 0, bandLength); //the amount of leds to be lit up, 50 is basically the max value any bin can have, might want to lower to make better looking
     int saturation = 200;
     int brightness = 200;
-    for (int j = ((i * bandLength)); j < ((i+1) * bandLength); j++) //start in the middle of each band length and go to the start of the next
+    for (int j = ((i * bandLength)); j < ((i+1) * bandLength); j++) //go from the start of one band to the next one
     {
-      if (j < ((i * bandLength) + intensity) || bumps[i])
+      if (j < ((i * bandLength) + intensity))
       {
-        stripLEDs[j] = CHSV(i*30, saturation, brightness);
-        saturation++;
-        brightness++;
+        stripLEDs[j] = CHSV(i*(256 / channels), saturation, brightness);
+        saturation += 5;
+        brightness += 5;
       }
       else
       {
-        stripLEDs[j].nscale8(192);
+        stripLEDs[j].nscale8(192); //fade by 75% instead of just turning off
         //stripLEDs[j] = CHSV(0, 0, 0); 
       }
     }
-    bumps[i] = false;
   }
   FastLED.show();
   delayMicroseconds(75);
@@ -357,18 +336,14 @@ void bumpsOnlyLinear()
 {
   for (int i = 0; i < 7; i++)
   {
-    readFrequencies(i);
-    detectBumps(i);
+    //readFrequencies(i);
+    //detectBumps(i);
     addBumpPixel(i);
   }
 }
 
 void linearSpectrumNoBumps()
 {
-  for (int i=0; i<7; i++)
-  {
-    readFrequencies(i);
-  }
   addSingleColorPixel();
 }
 
@@ -376,8 +351,8 @@ void linearSpectrumWithBumps()
 {
   for (int i=0; i<7; i++)
   {
-    readFrequencies(i);
-    detectBumps(i);
+    //readFrequencies(i);
+    //detectBumps(i);
     addBumpPixel(i);   
   }
   addSingleColorPixel();
@@ -388,8 +363,8 @@ void bumpsOnlyFlashesToNeutral()
 {
   for (int i=0; i<7; i++)
   {
-    readFrequencies(i);
-    detectBumps(i);
+    //readFrequencies(i);
+    //detectBumps(i);
     if (bumps[i])
     {
       fill_solid(stripLEDs, NUM_LEDS, CHSV(i*36, 255, 150));
@@ -410,8 +385,8 @@ void bumpsOnlyFlashesToBlack()
 {
   for (int i=0; i<7; i++)
   {
-    readFrequencies(i);
-    detectBumps(i);
+    //readFrequencies(i);
+    //detectBumps(i);
     if (bumps[i])
     {
       fill_solid(stripLEDs, NUM_LEDS, CHSV(i*36, 225, 125));
@@ -433,8 +408,8 @@ void rainbowGradientBumpStop()
   {
     for (int i=0; i<7; i++)
     {
-      readFrequencies(i);
-      detectBumps(i);
+      //readFrequencies(i);
+      //detectBumps(i);
       if (bumps[i])
       {
         //fill_solid(stripLEDs, NUM_LEDS, CHSV(i*36, 255, 150));
@@ -486,7 +461,7 @@ void bounce(int ctrl_brightness)
     stripLEDs[i] = CHSV((triwave8(i)), random8(150,255), ctrl_brightness);
     FastLED.show();
     //FastLED.clear();
-    delayMicroseconds(75);
+    delayMicroseconds(200);
   }
   for (uint16_t j=NUM_LEDS-1; j>=0+spd; j-=spd)
   {
@@ -494,7 +469,7 @@ void bounce(int ctrl_brightness)
     stripLEDs[j] = CHSV((triwave8(j)), random8(150,255), ctrl_brightness);
     FastLED.show();
     //FastLED.clear();
-    delayMicroseconds(75);
+    delayMicroseconds(200);
   }
 }
 
@@ -728,20 +703,21 @@ void loop()
     reconnect();
   }
   AIOClient.loop(); //check the data in the feeds
-  doLights(ctrl_effect, ctrl_palette, ctrl_brightness, ctrl_speed);
+  //doLights(ctrl_effect, ctrl_palette, ctrl_brightness, ctrl_speed);
+  readAudioData();
 
   /***Pick ONLY ONE of the following effects to run *************/
-  //noise();
+  //noise(ctrl_brightness);
   //bumpsOnlyFlashesToNeutral();
   //bumpsOnlyFlashesToBlack();
   //rainbowGradientBumpStop();
   //linearSpectrumNoBumps();
   //linearSpectrumWithBumps();
   //bumpsOnlyLinear();
-  //sevenBandEQFromMid();
-  //sevenBandEQ();
+  //EQFromMid();
+  //EQ();
   //simpleChase();
   //bounceUsingWaves();
-  //bounce();
+  //bounce(ctrl_brightness);
   //testSin();
 }
