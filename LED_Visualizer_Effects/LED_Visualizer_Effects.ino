@@ -1,7 +1,9 @@
+#define FASTLED_USE_GLOBAL_BRIGHTNESS 1
 #include <FastLED.h>
 #include <SPI.h>
 #include <Ethernet.h>
 #include <PubSubClient.h>
+
 
 
 #include <Audio.h>
@@ -35,6 +37,7 @@ AudioControlSGTL5000 audioShield;
 #define FEED4 "FillGee/feeds/current-palette"
 #define FEED5 "FillGee/feeds/single-color"
 #define FEED6 "FillGee/feeds/speed"
+#define FEED7 "FillGee/feeds/threshold"
 byte mac[]    = {  0xDE, 0xED, 0xBA, 0xFE, 0xFE, 0xED }; //setup a generic MAC adress for the teensy
 //IPAddress ip(192, 168, 0, 182); //in case we dont want to use DHCP we can have it connect under a certain IP address
 EthernetClient ethClient; //initialize an ethernet connection to the internet
@@ -47,18 +50,19 @@ int ctrl_brightness; //make an int (0-100) to hold the brightness percentage
 String ctrl_palette; //make a string to hold the palette status
 //string color //should be a hex thing, research 
 int ctrl_speed; //make an int (0-100) to hold the speed of effects
+int ctrl_threshold;
 
 //define all the FastLED strip info so its here to change if needed. Updated to use teensy 4.0 parallel output stuff
-#define STRIP_DATA 11
-#define CLOCK_PIN 14
+#define STRIP_DATA 14
+#define CLOCK_PIN 18
 #define NUM_STRIPS 1
-#define NUM_LEDS_PER_STRIP 300
-#define NUM_LEDS 300
+#define NUM_LEDS_PER_STRIP 144
+#define NUM_LEDS 144
 #define STRIP_TYPE APA102
 #define COLOR_ORDER BGR
 
 
-CRGBArray<NUM_LEDS_PER_STRIP * NUM_STRIPS> stripLEDs; //make an array with an entry for each LED on the strip, of the type CRGB which is used by FastLED
+CRGBArray<NUM_LEDS_PER_STRIP> stripLEDs; //make an array with an entry for each LED on the strip, of the type CRGB which is used by FastLED
 
 /****************THIS WILL ALL BE DELETED NOW THAT THE MSGEQ7s ARE NO LONGER USED IN FAVOR OF ADC AUDIO PROCESSING ********************************/ 
 int freq;
@@ -69,6 +73,7 @@ int i;
 int matrixRow;
 int matrixColumn;
 
+int channels = 16; //we could change this to a higher number, but 16 works well for what my goals are
 float level[16]; //array to hold the 16 frequency bands
 int peakLevel; //int to hold the current peak/loudness level
 float averageFreq; //float to hold the "average" frequency
@@ -96,6 +101,20 @@ int oldHueDiff[300];
 int currentHueDiff[300];
 uint8_t baseHue;
 
+//noise random numbers and variables
+int scale = 100; //makes the noise more... noisy
+int difference = 85; //the maximum difference in hues that the "noise" can have from the base hue
+int randomX;
+int randomY;
+int randomZ;
+
+//bounce variables that we dont want to update every time
+int bounceLocation = 0;
+int bounceDirection = 1;
+
+//disolve function array for randomization, variables
+int pixelOrder[300];
+
 CRGBPalette16 currentPalette;
 
 void setup()
@@ -103,11 +122,11 @@ void setup()
     AudioMemory(12);
     audioShield.enable();
     audioShield.inputSelect(AUDIO_INPUT_LINEIN);
-    audioShield.volume(0.8);
+    audioShield.volume(0.7);
     //myFFT.windowFunction(AudioWindowHanning1024);
   
-    FastLED.addLeds<STRIP_TYPE, STRIP_DATA, CLOCK_PIN, COLOR_ORDER, DATA_RATE_MHZ(24)>(stripLEDs, NUM_LEDS); //constructs the led strip with FastLED so it knows how to drive it
-    FastLED.setBrightness(255); //set the brightness globally, everything else will be a percentage of this?
+    FastLED.addLeds<STRIP_TYPE, STRIP_DATA, CLOCK_PIN, COLOR_ORDER, DATA_RATE_MHZ(12)>(stripLEDs, NUM_LEDS); //constructs the led strip with FastLED so it knows how to drive it
+    FastLED.setBrightness(128); //set the brightness globally, everything else will be a percentage of this? APAs are stupid bright, clamp them down!
     
     FastLED.clear();
     FastLED.show();
@@ -121,19 +140,26 @@ void setup()
     FastLED.clear();
     FastLED.show();
 
+    randomX = random16(); //generate random numbers for the noise function
+    randomY = random16(); //generate random numbers for the noise function
+    randomZ = random16(); //generate random numbers for the noise function
+    arrayShuffle(); //generate a random array of indices for the amount of leds we have. Do this on setup so when dissolve is called the first time it doesnt lag
+
     AIOClient.connect("teensyClient", AIO_USERNAME, AIO_KEY); //connect to the AIO feeds so we can write the default states to them so we dont have de-sync
     powered = true; //initially powered
     AIOClient.publish("FillGee/feeds/on-status", "ON"); //send the initial power state to MQTT so we dont have a de-sync on the dashboard
-    ctrl_brightness = 90;
-    AIOClient.publish("FillGee/feeds/led-brightness", "90"); //set initial brightness to 90 and send that over MQTT
+    ctrl_brightness = 40;
+    AIOClient.publish("FillGee/feeds/led-brightness", "40"); //set initial brightness to 90 and send that over MQTT
     ctrl_effect = "Noise";
     AIOClient.publish("FillGee/feeds/effect", "Noise"); //set initial effect to noise since its the most interesting and sync with MQTT
     currentPalette = RainbowColors_p;
     AIOClient.publish("FillGee/feeds/current-palette", "RainbowColors_p"); //set initial palette to rainbow colors as its the most visually interesting and sync with MQTT
-    
-    currentPalette = RainbowColors_p;
-    ctrl_brightness = 90;
+    ctrl_speed = 50;
+    AIOClient.publish("FillGee/feeds/speed", "50");
+    ctrl_threshold = 20;
+    AIOClient.publish("FillGee/feeds/threshold", "20");
     updates = false;
+    
     Serial.println("Connected to Adafruit IO and set initial values!");
     AIOClient.disconnect(); //dont know why this is needed, but if we dont have it the MQTT updates never come through. I guess between publishing and subscribing it needs to disconnect?
     Serial.println("Disconnecting from Adafruit IO now that initial values have been set.");
@@ -167,9 +193,9 @@ void readAudioData()
       //calculate the "average" frequency based on the 16 above, but with a range of 1-16
       averageFreq = 0.0;
       totalLevel = 0.1;
-      for (int i=0; i<16; i++)
+      for (int i=0; i<channels; i++)
       {
-        if (level[i] > 9.00) //ignore it if its small, which just makes the data more variable
+        if (level[i] > ctrl_threshold) //ignore it if its small, which just makes the data more variable and less midtone averagey
         {
           averageFreq += ((i+1) * level[i]); //really just summing up all the frequencies
           totalLevel += level[i];
@@ -181,7 +207,7 @@ void readAudioData()
       //Serial.print("Frequency: ");
       //Serial.println(averageFreq);
       //Serial.println();
-      Serial.println(level[1]); //debug to see the values
+      //Serial.println(level[1]); //debug to see the values in bin 2
       if (peak1.available())
       {
         peakLevel = peak1.read() * 255.0; //this makes it into an int from 0-255 which correlates nicely to saturation/brightness
@@ -214,19 +240,28 @@ void detectBumps(int freq)
 }
 
 
-void addSingleColorPixel()
+void linearAverageFrequency(int bright, int spd)
 {
-  readAudioData(); //update the FFT and peak values to get the averageFreq
-  oldAvgColor = avgColor; //take the most recent average color and store it here so we can use it to blend
-  avgColor = CHSV(averageFreq * 16, 225, peakLevel); //make the color based on average frequency and the loudness as the brightness
-
-  avgColor = blend(oldAvgColor, avgColor, 128); //we can take the color between the last color and the current one to get more of a smooth gradient between colors instead of jumps from red > green etc
-  moveRight(1); //move all the pixels right one before adding the new pixel
+  while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
+  {
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.
+    EVERY_N_MILLIS_I(delayMs, 15)
+    {
+      delayMs.setPeriod(map(spd, 0, 100, 30, -1));
+      readAudioData(); //update the FFT and peak values to get the averageFreq
+      oldAvgColor = avgColor; //take the most recent average color and store it here so we can use it to blend
+      int scaledBrightness = map(peakLevel, 0, 255, 0, bright);
+      //avgColor = CHSV(averageFreq * 16, 255, scaledBrightness); //make the color based on average frequency and the loudness as the brightness
+      avgColor = ColorFromPalette(currentPalette, averageFreq * 16, scaledBrightness, LINEARBLEND);
+      
+      avgColor = blend(oldAvgColor, avgColor, 128); //we can take the color between the last color and the current one to get more of a smooth gradient between colors instead of jumps from red > green etc
+      moveRight(1); //move all the pixels right one before adding the new pixel
   
-  stripLEDs[0] = avgColor; //sets the first pixel to the "average" color of the song at that moment. Then use move right to move it down the chain
+      stripLEDs[0] = avgColor; //sets the first pixel to the "average" color of the song at that moment. Then use move right to move it down the chain
 
-  FastLED.show();
-  delayMicroseconds(75);
+      FastLED.show();
+    }
+  } 
 }
 
 
@@ -236,8 +271,6 @@ void moveRight(int pixels)
   {    
     stripLEDs[j] = stripLEDs[j-pixels];
   }
-  FastLED.show();
-  delayMicroseconds(75);
 }
 
 void moveLeft(int pixels)
@@ -246,79 +279,70 @@ void moveLeft(int pixels)
   {    
     stripLEDs[j] = stripLEDs[j+pixels];
   }
-  FastLED.show();
-  delayMicroseconds(75);
 }
 
-void EQFromMid()
+//makes a n-channel EQ/visualizer from the FFT data. Will update to the current brightness and palette, but speed does nothing. 
+void EQ(int bright)
 {
-  int channels = 16; //change this to another number for more/less bins. But since our FFT is set up to have 16 bins, thats what we use
-  stripLEDs.fadeToBlackBy(25);
-  readAudioData(); //update the 16 FFT bins
-  for (int i = 0; i < channels; i++)
+  while (!updates)
   {
-    int bandLength = NUM_LEDS / channels; //set each band to be 1/16 of the overal strip length
-    intensity = map(level[i], 0, 50, 0, bandLength); //the amount of leds to be lit up, 50 is basically the max value any bin can have, might want to lower to make better looking
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.
+    readAudioData(); //update the 16 FFT bins
+    fadeToBlackBy(stripLEDs, NUM_LEDS, 32); //1/8th fade every loop, "lowers" each segment down and fades them out
     
-    for (int j = ((i * bandLength) + (bandLength / 2)); j < ((i+1) * bandLength); j++) //start in the middle of each band length and go to the start of the next
+    for (int i = 0; i < channels; i++)
     {
-      if (j < ((i * bandLength) + (bandLength / 2) + (intensity / 2))) //for each LED in our 1/16 strip, check if we have lit less than the goal number/2 since its only the top half here
+      int bandLength = NUM_LEDS / channels; //set each band to be 1/16 of the overal strip length
+      intensity = map(level[i], 0, 40, 0, bandLength); //the amount of leds to be lit up, 50 is basically the max value any bin can have, 40 seems pretty good
+      for (int j = ((i * bandLength)); j < ((i+1) * bandLength); j++) //go from the start of one band to the next one
       {
-        stripLEDs[j] = CHSV(i*(256 / channels), 220, 180); //set the color to be fraction of the CHSV color wheel, in the 16 channel case each band will have a 16 value offset in color
-      }
-      else
-      {
-        stripLEDs[j].nscale8(196); //fade by 75% instead of just setting off, so if it was lit the last update it just fades
-        //stripLEDs[j] = CHSV(0, 0, 0); 
+        if (j < ((i * bandLength) + intensity)) //if the index we are on falls within the "length" of the instensity, it needs to be lit. Otherwise it will be faded in the main loop
+        {
+          stripLEDs[j] = ColorFromPalette(currentPalette, i * (256 / channels), bright, LINEARBLEND); //set the LED color to be one of the colors you can get from the current palette, with global brightness
+        }
       }
     }
-    //now do the same in reverse
-    for (int j = ((i * bandLength) + (bandLength / 2)); j > (i * bandLength); j--) //start in the middle of each band length and go backwards to the start of the band
-    {
-      if (j > ((i * bandLength) + (bandLength / 2) - (intensity / 2)))
-      {
-        stripLEDs[j] = CHSV(i*(256 / channels), 220, 180);
-      }
-      else
-      {
-        stripLEDs[j].nscale8(196);
-        //stripLEDs[j] = CHSV(0, 0, 0); 
-      }
-    }
+    FastLED.show();
+    delay(20); //if we dont have enough delay it looks more flickery and annoying
   }
-  FastLED.show();
-  delayMicroseconds(75);
 }
 
-void EQ()
+//similar to the EQ above, but each band will light from the middle out instead of left>right. 
+void EQFromMid(int bright)
 {
-  int channels = 16; //change this to another number for more/less bins. But since our FFT is set up to have 16 bins, thats what we use
-  stripLEDs.fadeToBlackBy(25);
-  readAudioData(); //update the 16 FFT bins
-  for (int i = 0; i < channels; i++)
+  while (!updates)
   {
-    int bandLength = NUM_LEDS / channels; //set each band to be 1/16 of the overal strip length
-    intensity = map(level[i], 0, 50, 0, bandLength); //the amount of leds to be lit up, 50 is basically the max value any bin can have, might want to lower to make better looking
-    int saturation = 200;
-    int brightness = 200;
-    for (int j = ((i * bandLength)); j < ((i+1) * bandLength); j++) //go from the start of one band to the next one
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.
+    readAudioData(); //update the 16 FFT bins
+    fadeToBlackBy(stripLEDs, NUM_LEDS, 32); //1/8th fade every loop, "lowers" each segment down and fades them out
+    
+    for (int i = 0; i < channels; i++)
     {
-      if (j < ((i * bandLength) + intensity))
+      int bandLength = NUM_LEDS / channels; //set each band to be 1/16 of the overal strip length
+      intensity = map(level[i], 0, 40, 0, bandLength); //the amount of leds to be lit up, 50 is basically the max value any bin can have, 40 seems pretty responsive without maxing out a lot
+    
+      for (int j = ((i * bandLength) + (bandLength / 2)); j < ((i+1) * bandLength); j++) //start in the middle of each band length and go to the start of the next
       {
-        stripLEDs[j] = CHSV(i*(256 / channels), saturation, brightness);
-        saturation += 5;
-        brightness += 5;
+        if (j < ((i * bandLength) + (bandLength / 2) + (intensity / 2))) //for each LED in our 1/16 strip, check if we have lit less than the goal number/2 since its only the top half here
+        {
+          stripLEDs[j] = ColorFromPalette(currentPalette, i * (256 / channels), bright, LINEARBLEND); //set the color to be a fraction of the current palette, with the global brightness
+        }
       }
-      else
+      //now do the same in reverse
+      for (int j = ((i * bandLength) + (bandLength / 2)); j > (i * bandLength); j--) //start in the middle of each band length and go backwards to the start of the band
       {
-        stripLEDs[j].nscale8(192); //fade by 75% instead of just turning off
-        //stripLEDs[j] = CHSV(0, 0, 0); 
+        if (j > ((i * bandLength) + (bandLength / 2) - (intensity / 2)))
+        {
+          //stripLEDs[j] = CHSV(i*(256 / channels), 220, bright);
+          stripLEDs[j] = ColorFromPalette(currentPalette, i * (256 / channels), bright, LINEARBLEND);
+        }
       }
     }
+    FastLED.show();
+    delay(20); //if we dont have enough delay it looks more flickery and annoying
   }
-  FastLED.show();
-  delayMicroseconds(75);
 }
+
 
 void addBumpPixel(int i) //broke this out so I can do more complicated stuff to it later
 {
@@ -342,11 +366,6 @@ void bumpsOnlyLinear()
   }
 }
 
-void linearSpectrumNoBumps()
-{
-  addSingleColorPixel();
-}
-
 void linearSpectrumWithBumps()
 {
   for (int i=0; i<7; i++)
@@ -355,7 +374,7 @@ void linearSpectrumWithBumps()
     //detectBumps(i);
     addBumpPixel(i);   
   }
-  addSingleColorPixel();
+  //addSingleColorPixel();
   delayMicroseconds(75);
 }
 
@@ -452,25 +471,30 @@ void simpleChase(int bright) //need to document this one better, its kinda confu
   }
 }
 
-void bounce(int ctrl_brightness)
+void bounce(int bright, int spd)
 {
-  uint8_t spd = 1;
-  for (uint16_t i=0; i<NUM_LEDS-spd; i+=spd)
+  while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
   {
-    fadeToBlackBy(stripLEDs, NUM_LEDS, (64 /  spd));
-    stripLEDs[i] = CHSV((triwave8(i)), random8(150,255), ctrl_brightness);
-    FastLED.show();
-    //FastLED.clear();
-    delayMicroseconds(200);
-  }
-  for (uint16_t j=NUM_LEDS-1; j>=0+spd; j-=spd)
-  {
-    fadeToBlackBy(stripLEDs, NUM_LEDS, (64 / spd));
-    stripLEDs[j] = CHSV((triwave8(j)), random8(150,255), ctrl_brightness);
-    FastLED.show();
-    //FastLED.clear();
-    delayMicroseconds(200);
-  }
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.
+    EVERY_N_MILLIS_I(delayMs, 5)
+    {
+      delayMs.setPeriod(map(spd, 0, 100, 20, -1)); //dynamically update the speed based on the mqtt speed values. 20ms max delay is pretty slow, -1 with the map gives us 0ms
+      fadeToBlackBy(stripLEDs, NUM_LEDS, 32); //1/8th fade every loop
+      //stripLEDs[bounceLocation] = CHSV((triwave8(bounceLocation)), 255, bright);
+      stripLEDs[bounceLocation] = ColorFromPalette(currentPalette, map(bounceLocation, 0, NUM_LEDS-1, 0, 255), bright, LINEARBLEND);
+      FastLED.show();
+      bounceLocation += bounceDirection;
+      
+      if (bounceLocation == 0)
+      {
+        bounceDirection = 1;
+      }
+      if (bounceLocation == NUM_LEDS-1)
+      {
+        bounceDirection = -1;
+      }
+    }
+  } 
 }
 
 void bounceUsingWaves() //neat lightweight implementation using the triwave function and mapping it to our length. Issue is it wont hit every LED because waves only go 0-255
@@ -507,49 +531,129 @@ void testSin()
   delay(9999999999999999999999999999999999999999999999999);
 }
 
-void lighthouse()
+//set the entire strip to the same color from a palette. Then, select a random pixel and turn it to a different color, brighter, then fade it back to the "background" color
+void twinkle(int bright, int spd)
 {
-  
-}
-
-void noise(int bright)
-{
-  int scale = 100; //makes the noise more... noisy
-  int difference = 85; //the maximum difference in hues that the "noise" can have from the base hue
-  int x = random16(); //get random numbers for x, y, z to seed the noise
-  int y = random16();
-  int z = random16();
+  int i = 0;
+  CRGB backgroundColor = ColorFromPalette(currentPalette, baseHue, bright, LINEARBLEND);
   while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
   {
-    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.  
-    for (int i=0; i<NUM_LEDS; i++)
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.
+    EVERY_N_MILLIS_I(delayMs1, 50)
     {
-      oldHueDiff[i] = currentHueDiff[i];
-      currentHueDiff[i] = map(inoise8((x + i*scale), (y + baseHue*scale), z), 0, 255, (-1 * (difference / 2)), (difference / 2)); //map the noise taken with 3 variables to a range of the difference, from -.5difference to +.5difference
-
-      //next line is a very long one that just blends between the last noise and the current one for a color in the palette to smooth out the pixel flickering
-      stripLEDs[i] = blend(ColorFromPalette(currentPalette, baseHue+currentHueDiff[i], bright, LINEARBLEND), ColorFromPalette(currentPalette, baseHue+oldHueDiff[i], bright, LINEARBLEND), 100);
-      x += scale / 4; //update the x, y, and z values at different rates as we go down the strip so each light can be different
-      y -= scale / 8;
-      z += scale;
+      stripLEDs[pixelOrder[i]] = ColorFromPalette(currentPalette, random8(), 255, LINEARBLEND); //set a random pixel to random color, full brightness
+      delayMs1.setPeriod(map(spd, 0, 100, 500, -1));
+      FastLED.show();
+      if (i == NUM_LEDS-1)
+      {
+        i = 0;
+        arrayShuffle();
+      }
+      else
+      {
+        i++;
+      }
     }
-  FastLED.show();
-  delay(60);
-  baseHue++; //move through the palette hues
+    EVERY_N_MILLIS_I(delayMs2, 5) //every two hundreth of a second fade the sparkles back to the background color
+    {
+      for (int i = 0; i < NUM_LEDS; i++)
+      {
+        stripLEDs[i] = nblend(stripLEDs[i], backgroundColor, 32); //blend by 1/8th back towards the background color
+        FastLED.show();
+      }
+    }
+    EVERY_N_MILLIS_I(delayMs3, 1000) //every second update the hue
+    {
+      baseHue += 5;
+      backgroundColor = ColorFromPalette(currentPalette, baseHue, bright, LINEARBLEND);
+    }
+  }
+}
+
+void noise(int bright, int spd)
+{
+  while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
+  {
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.
+    EVERY_N_MILLIS_I(delayMs, 60)
+    { 
+      delayMs.setPeriod(map(spd, 0, 100, 200, -1));
+      for (int i=0; i<NUM_LEDS; i++)
+      {
+        oldHueDiff[i] = currentHueDiff[i];
+        currentHueDiff[i] = map(inoise8((randomX + i*scale), (randomY + baseHue*scale), randomZ), 0, 255, (-1 * (difference / 2)), (difference / 2)); //map the noise taken with 3 variables to a range of the difference, from -.5difference to +.5difference
+
+        //next line is a very long one that just blends between the last noise and the current one for a color in the palette to smooth out the pixel flickering
+        stripLEDs[i] = blend(ColorFromPalette(currentPalette, baseHue+currentHueDiff[i], bright/2, LINEARBLEND), ColorFromPalette(currentPalette, baseHue+oldHueDiff[i], bright/2, LINEARBLEND), 100);
+        randomX += scale / 4; //update the x, y, and z values at different rates as we go down the strip so each light can be different
+        randomY -= scale / 8;
+        randomZ += scale;
+      }
+        FastLED.show();
+        baseHue++; //move through the palette hues
+    }
+  }
+}
+
+//fisher-yates randomization for arrays. https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle
+void arrayShuffle()
+{
+  //first we want to generate our array with NUM_LEDS elements in order before we swap
+  for (int i = 0; i < NUM_LEDS; i++)
+  {
+    pixelOrder[i] = i;
+  }
+  //now we use Fisher-Yates to swap elements around
+  for (int i = NUM_LEDS-1; i > 0; --i) //go from the max index down to 0
+  {
+    int j = random(0, i+1); //make a random number between 0 and i
+    int t = pixelOrder[i]; //put the old value into a temporary storage variable
+    pixelOrder[i] = pixelOrder[j]; //swap the max index with the random one
+    pixelOrder[j] = t; //complete the swap
+  }
+}
+
+//select a random color from the palette. Take an array of random pixel indices and set them one at a time to that color. Once all pixels are the new color, change the color and repeat
+void dissolve(int bright, int spd)
+{
+  CRGB targetColor = ColorFromPalette(currentPalette, random8(), bright, LINEARBLEND);
+  int i = 0;
+  while (!updates) //just run this in a loop until theres updates, then it can return to the main loop function. However if we dont check for updates within the function we never exit
+  {
+    AIOClient.loop(); //check the data in the feeds while this is running so we know if we should stop ever.
+    EVERY_N_MILLIS_I(delayMs, 60)
+    { 
+      delayMs.setPeriod(map(spd, 0, 100, 120, -1)); //update the delay so it is responsive.
+      stripLEDs[pixelOrder[i]] = targetColor;
+      FastLED.show();
+      
+      if (i == NUM_LEDS-1) //if we reach the end of the strip we want to go back to the start with a new color and a new order of pixels to light up
+      {
+        i = 0;
+        CRGB oldColor = targetColor;
+        targetColor = blend(oldColor,ColorFromPalette(currentPalette, random8(), bright, LINEARBLEND), 128); //get a new random color from the palette, blended with the old one 50%
+        arrayShuffle();
+      }
+      else
+      {
+        i++;
+      }
+    }
   }
 }
 
 void handleFeeds(char* topic, byte* payload, unsigned int length) //the function that is called anytime there is new data in any of the feeds
 {
   updates = true; //set the update flag to true because something has changed
-  //right now just display the message, will write the switch cases later
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
-  for (int i=0;i<length;i++) {
+  for (int i=0;i<length;i++) 
+  {
     Serial.print((char)payload[i]);
   }
   Serial.println();
+  
   if (strcmp(topic, "FillGee/feeds/effect") == 0) //we use this str compare function (which returns 0 when the strings are the same) to find out which topic it is
   {
     Serial.print("Updated the effect status to: ");
@@ -591,6 +695,15 @@ void handleFeeds(char* topic, byte* payload, unsigned int length) //the function
     String s = String((char*)payload);
     ctrl_speed = s.toInt();
     Serial.println(ctrl_speed);
+  }
+  
+  if (strcmp(topic, "FillGee/feeds/threshold") == 0) //handles the audio threshold data
+  {
+    Serial.print("Updated audio threshold to: ");
+    payload[length] = '\0';
+    String s = String((char*)payload);
+    ctrl_threshold = s.toInt();
+    Serial.println(ctrl_threshold);
   }
   
   if (strcmp(topic, "FillGee/feeds/current-palette") == 0) //handles the palette switching
@@ -650,6 +763,7 @@ void reconnect() //function that connects to AIO and subscribes to the feeds
       AIOClient.subscribe(FEED4);
       AIOClient.subscribe(FEED5);
       AIOClient.subscribe(FEED6);
+      AIOClient.subscribe(FEED7);
     }
     else
     {
@@ -674,22 +788,49 @@ void doLights(String effect, String palette, int bright, int spd)
     if (effect == "Bounce")
     {
       Serial.println("Starting bounce function");
-      bounce(bright); //implement speed later
+      bounce(bright, spd);
     }
     if (effect == "Noise")
     {
       Serial.println("Starting noise function");
-      noise(bright); //implement speed later
+      noise(bright, spd);
     }
+    if (effect == "Linear Frequency")
+    {
+      Serial.println("Starting the average frequency linear function");
+      linearAverageFrequency(bright, spd);
+    }
+    if (effect == "EQ")
+    {
+      Serial.println("Starting the EQ function");
+      EQ(bright);
+    }
+    if (effect == "EQMid")
+    {
+      Serial.println("Starting the EQ from the middle function");
+      EQFromMid(bright);
+    }
+    if (effect == "Dissolve")
+    {
+      Serial.println("Starting the dissovle function");
+      dissolve(bright, spd);
+    }
+    if (effect == "Twinkle")
+    {
+      Serial.println("Starting the twinkle function");
+      twinkle(bright, spd);
+    }    
     else
     {
-      FastLED.clear();
-      FastLED.show();
+      AIOClient.loop(); //check the data in the feeds
+      //FastLED.clear();
+      //FastLED.show();
       delay(25);
     }
   }
   else
   {
+    AIOClient.loop(); //check the data in the feeds to see if we should turn back on
     FastLED.clear();
     FastLED.show();
     delay(25);
@@ -702,9 +843,9 @@ void loop()
   {
     reconnect();
   }
-  AIOClient.loop(); //check the data in the feeds
-  //doLights(ctrl_effect, ctrl_palette, ctrl_brightness, ctrl_speed);
-  readAudioData();
+  //AIOClient.loop(); //check the data in the feeds
+  doLights(ctrl_effect, ctrl_palette, ctrl_brightness, ctrl_speed);
+  //readAudioData();
 
   /***Pick ONLY ONE of the following effects to run *************/
   //noise(ctrl_brightness);
@@ -716,6 +857,7 @@ void loop()
   //bumpsOnlyLinear();
   //EQFromMid();
   //EQ();
+  //addSingleColorPixel();
   //simpleChase();
   //bounceUsingWaves();
   //bounce(ctrl_brightness);
